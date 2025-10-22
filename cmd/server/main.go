@@ -1,12 +1,18 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/Albert12932/weather-service/internal/client/http/geocoding"
 	"github.com/Albert12932/weather-service/internal/client/http/openMeteo"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/joho/godotenv"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -19,21 +25,37 @@ const httpPort = ":3000"
 const city = "Moscow"
 
 type Reading struct {
-	Timestamp   time.Time
-	Temperature float64
-}
-
-type Storage struct {
-	data map[string][]Reading
-	mu   sync.RWMutex
+	Name        string    `json:"name"`
+	Timestamp   time.Time `json:"timestamp"`
+	Temperature float64   `json:"temperature"`
 }
 
 func main() {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 
-	storage := &Storage{
-		data: make(map[string][]Reading),
+	ctx := context.Background()
+
+	err := godotenv.Load()
+	if err != nil {
+		panic(err)
+	}
+
+	pool, err := pgxpool.New(ctx,
+		fmt.Sprintf("postgres://%s:%s@localhost:54321/%s",
+			os.Getenv("POSTGRES_USER"),
+			os.Getenv("POSTGRES_PASSWORD"),
+			os.Getenv("POSTGRES_DB")),
+	)
+
+	if err != nil {
+		panic(err)
+	}
+	defer pool.Close()
+
+	err = pool.Ping(ctx)
+	if err != nil {
+		panic(err)
 	}
 
 	r.Get("/{city}", func(w http.ResponseWriter, r *http.Request) {
@@ -41,16 +63,26 @@ func main() {
 
 		fmt.Printf("Requested city: %s\n", cityName)
 
-		storage.mu.RLock()
-		defer storage.mu.RUnlock()
-		reading, ok := storage.data[cityName]
-		if !ok {
-			w.WriteHeader(http.StatusNotFound)
-			w.Write([]byte("city not found"))
+		var reading Reading
+
+		err = pool.QueryRow(ctx,
+			"SELECT name, timestamp, temperature from readings where name = $1 order by timestamp desc limit 1",
+			cityName,
+		).Scan(&reading.Name, &reading.Timestamp, &reading.Temperature)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				w.WriteHeader(http.StatusNotFound)
+				w.Write([]byte("No data for this city"))
+				return
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("Internal error"))
 			return
+
 		}
 
-		raw, err := json.Marshal(reading)
+		var raw []byte
+		raw, err = json.Marshal(reading)
 		if err != nil {
 			log.Println(err)
 		}
@@ -67,7 +99,7 @@ func main() {
 		panic(err)
 	}
 
-	jobs, err := initJobs(s, storage)
+	jobs, err := initJobs(s, ctx, pool)
 	if err != nil {
 		panic(err)
 	}
@@ -93,7 +125,7 @@ func main() {
 	wg.Wait()
 }
 
-func initJobs(scheduler gocron.Scheduler, storage *Storage) ([]gocron.Job, error) {
+func initJobs(scheduler gocron.Scheduler, ctx context.Context, pool *pgxpool.Pool) ([]gocron.Job, error) {
 
 	httpClient := &http.Client{
 		Timeout: time.Second * 10,
@@ -104,7 +136,7 @@ func initJobs(scheduler gocron.Scheduler, storage *Storage) ([]gocron.Job, error
 
 	j, err := scheduler.NewJob(
 		gocron.DurationJob(
-			10*time.Second,
+			5*time.Minute,
 		),
 		gocron.NewTask(
 			func() {
@@ -119,19 +151,20 @@ func initJobs(scheduler gocron.Scheduler, storage *Storage) ([]gocron.Job, error
 					log.Println(err)
 					return
 				}
-				storage.mu.Lock()
-				defer storage.mu.Unlock()
+
+				loc, _ := time.LoadLocation("Europe/Moscow")
 
 				timestamp, err := time.Parse("2006-01-02T15:04", openMetRes.Current.Time)
 				if err != nil {
 					log.Println(err)
 					return
 				}
+				timestamp = timestamp.In(loc)
 
-				storage.data[city] = append(storage.data[city], Reading{
-					Timestamp:   timestamp,
-					Temperature: openMetRes.Current.Temperature2m,
-				})
+				pool.Exec(ctx, "INSERT INTO readings (name, timestamp, temperature) VALUES ($1, $2, $3)",
+					city,
+					timestamp,
+					openMetRes.Current.Temperature2m)
 
 				fmt.Printf("%v updated data for city: %s\n", timestamp, city)
 			},
